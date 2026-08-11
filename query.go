@@ -1467,57 +1467,72 @@ type variableQuery struct {
 	Name     string
 	Prefix   string
 	Resolver VariableResolver
-	nodes    []NodeNavigator // cached resolved nodes
-	posit    int             // current iteration position
+	posit    int // current iteration position (reset by Clone)
 }
 
 func (v *variableQuery) Select(t iterator) NodeNavigator {
-	if v.nodes == nil {
-		// First call: resolve and cache all nodes
-		val, err := v.Resolver.ResolveVariable(v.Prefix, v.Name)
-		if err != nil {
-			return nil
-		}
-		switch val := val.(type) {
-		case NodeNavigator:
-			v.nodes = []NodeNavigator{val}
-		case []NodeNavigator:
-			v.nodes = val
-		default:
-			return nil
-		}
-		v.posit = 0
-	}
-	if v.posit >= len(v.nodes) {
-		return nil
-	}
-	node := v.nodes[v.posit]
-	v.posit++
-	return node
-}
-
-func (v *variableQuery) Evaluate(t iterator) interface{} {
+	// Resolve the variable on every Select call. We cannot cache across
+	// calls because variable values can change between iterations.
 	val, err := v.Resolver.ResolveVariable(v.Prefix, v.Name)
 	if err != nil {
-		return ""
+		return nil
 	}
 	switch val := val.(type) {
 	case NodeNavigator:
-		return val.Value()
-	case []NodeNavigator:
-		if len(val) > 0 {
-			return val[0].Value()
+		if v.posit == 0 {
+			v.posit++
+			return val
 		}
-		return ""
+		return nil
+	case []NodeNavigator:
+		if v.posit < len(val) {
+			node := val[v.posit]
+			v.posit++
+			return node
+		}
+		return nil
 	default:
-		return val
+		// Scalar value (string, float64, bool): wrap in a synthetic
+		// navigator so it behaves like a single text node.
+		if v.posit == 0 {
+			v.posit++
+			return &scalarNavigator{value: fmt.Sprintf("%v", val)}
+		}
+		return nil
 	}
 }
 
+// scalarNavigator wraps a scalar value as a minimal NodeNavigator.
+type scalarNavigator struct {
+	value string
+}
+
+func (s *scalarNavigator) NodeType() NodeType       { return TextNode }
+func (s *scalarNavigator) LocalName() string         { return "" }
+func (s *scalarNavigator) Prefix() string            { return "" }
+func (s *scalarNavigator) Value() string             { return s.value }
+func (s *scalarNavigator) Copy() NodeNavigator       { return &scalarNavigator{value: s.value} }
+func (s *scalarNavigator) MoveToRoot()               {}
+func (s *scalarNavigator) MoveToParent() bool        { return false }
+func (s *scalarNavigator) MoveToNextAttribute() bool { return false }
+func (s *scalarNavigator) MoveToChild() bool         { return false }
+func (s *scalarNavigator) MoveToFirst() bool         { return false }
+func (s *scalarNavigator) MoveToNext() bool          { return false }
+func (s *scalarNavigator) MoveToPrevious() bool      { return false }
+func (s *scalarNavigator) MoveTo(NodeNavigator) bool { return false }
+
+func (v *variableQuery) Evaluate(t iterator) interface{} {
+	// Return self so that antchfx functions like count() can iterate
+	// via Select(). Reset position so repeated evaluations start fresh.
+	v.posit = 0
+	return v
+}
+
 func (v *variableQuery) Clone() query {
+	// Reset position so a cloned query starts fresh iteration
 	return &variableQuery{
 		Name: v.Name, Prefix: v.Prefix, Resolver: v.Resolver,
-		nodes: v.nodes, posit: v.posit,
+		posit: 0,
 	}
 }
 
@@ -1533,42 +1548,68 @@ type functionResolverQuery struct {
 	FuncName string
 	Args     []query
 	Resolver FunctionResolver
+	nodes    []NodeNavigator // cached resolved nodes for Select iteration
+	posit    int             // current Select position
 }
 
 func (f *functionResolverQuery) Select(t iterator) NodeNavigator {
-	val := f.Evaluate(t)
-	if nav, ok := val.(NodeNavigator); ok {
-		return nav
+	if f.nodes == nil {
+		// First call: resolve arguments and call the function
+		resolvedArgs := make([]interface{}, len(f.Args))
+		for i, arg := range f.Args {
+			if _, isResolver := arg.(*functionResolverQuery); isResolver {
+				// Nested resolver: call Evaluate (returns self), then iterate
+				resolvedArgs[i] = collectNodes(arg, t)
+			} else {
+				switch arg.ValueType() {
+				case xpathResultType.NodeSet, xpathResultType.Any:
+					resolvedArgs[i] = collectNodes(arg, t)
+				default:
+					resolvedArgs[i] = arg.Evaluate(t)
+				}
+			}
+		}
+		val, err := f.Resolver.ResolveFunction(f.Prefix, f.FuncName, resolvedArgs)
+		if err != nil {
+			f.nodes = []NodeNavigator{}
+		} else {
+			switch v := val.(type) {
+			case NodeNavigator:
+				f.nodes = []NodeNavigator{v}
+			case []NodeNavigator:
+				f.nodes = v
+			default:
+				// Scalar result (string, float64, bool): wrap in a
+				// synthetic navigator so it behaves like a single node.
+				f.nodes = []NodeNavigator{&scalarNavigator{value: fmt.Sprintf("%v", v)}}
+			}
+		}
+		f.posit = 0
 	}
-	return nil
+	if f.posit >= len(f.nodes) {
+		return nil
+	}
+	node := f.nodes[f.posit]
+	f.posit++
+	return node
+}
+
+// collectNodes evaluates a query and collects all matching NodeNavigators.
+func collectNodes(q query, t iterator) []NodeNavigator {
+	var nodes []NodeNavigator
+	for node := q.Select(t); node != nil; node = q.Select(t) {
+		nodes = append(nodes, node)
+	}
+	return nodes
 }
 
 func (f *functionResolverQuery) Evaluate(t iterator) interface{} {
-	resolvedArgs := make([]interface{}, len(f.Args))
-	for i, arg := range f.Args {
-		// For nested function resolvers, use Evaluate directly.
-		// For nodeset queries, iterate all matching nodes.
-		// For scalar queries, get the evaluated value.
-		if _, isResolver := arg.(*functionResolverQuery); isResolver {
-			resolvedArgs[i] = arg.Evaluate(t)
-		} else {
-			switch arg.ValueType() {
-			case xpathResultType.NodeSet, xpathResultType.Any:
-				var nodes []NodeNavigator
-				for node := arg.Select(t); node != nil; node = arg.Select(t) {
-					nodes = append(nodes, node)
-				}
-				resolvedArgs[i] = nodes
-			default:
-				resolvedArgs[i] = arg.Evaluate(t)
-			}
-		}
-	}
-	val, err := f.Resolver.ResolveFunction(f.Prefix, f.FuncName, resolvedArgs)
-	if err != nil {
-		return ""
-	}
-	return val
+	// Evaluate is called by antchfx functions like count(), which expect
+	// the result to be a query for Select iteration. Return self.
+	// Reset state so repeated evaluations start fresh.
+	f.nodes = nil
+	f.posit = 0
+	return f
 }
 
 func (f *functionResolverQuery) Clone() query {
@@ -1576,7 +1617,10 @@ func (f *functionResolverQuery) Clone() query {
 	for i, a := range f.Args {
 		args[i] = a.Clone()
 	}
-	return &functionResolverQuery{Prefix: f.Prefix, FuncName: f.FuncName, Args: args, Resolver: f.Resolver}
+	return &functionResolverQuery{
+		Prefix: f.Prefix, FuncName: f.FuncName, Args: args, Resolver: f.Resolver,
+		posit: 0,
+	}
 }
 
 func (f *functionResolverQuery) ValueType() resultType { return xpathResultType.Any }
