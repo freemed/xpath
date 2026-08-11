@@ -70,6 +70,22 @@ type NodeNavigator interface {
 	MoveTo(NodeNavigator) bool
 }
 
+// FunctionResolver resolves extension functions not built into the XPath engine.
+// The resolver is called at evaluation time when an unknown function is encountered.
+// Args contains the resolved argument values (string, float64, bool, or NodeNavigator).
+type FunctionResolver interface {
+	ResolveFunction(prefix, name string, args []interface{}) (interface{}, error)
+}
+
+// VariableResolver resolves $variable references at evaluation time.
+// Return values:
+//   - string, float64, bool: scalar literal
+//   - NodeNavigator: singleton nodeset (for path steps like $var/child)
+//   - []NodeNavigator: multi-node nodeset
+type VariableResolver interface {
+	ResolveVariable(prefix, name string) (interface{}, error)
+}
+
 // NodeIterator holds all matched Node object.
 type NodeIterator struct {
 	node  NodeNavigator
@@ -141,7 +157,7 @@ func Compile(expr string) (*Expr, error) {
 	if expr == "" {
 		return nil, errors.New("expr expression is nil")
 	}
-	qy, err := build(expr, nil)
+	qy, err := build(expr, nil, nil, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -165,12 +181,30 @@ func CompileWithNS(expr string, namespaces map[string]string) (*Expr, error) {
 	if expr == "" {
 		return nil, errors.New("expr expression is nil")
 	}
-	qy, err := build(expr, namespaces)
+	qy, err := build(expr, namespaces, nil, nil)
 	if err != nil {
 		return nil, err
 	}
 	if qy == nil {
 		return nil, fmt.Errorf(fmt.Sprintf("undeclared variable in XPath expression: %s", expr))
+	}
+	return &Expr{s: expr, q: qy}, nil
+}
+
+// CompileWithResolvers compiles an XPath expression with variable and function
+// resolvers. When non-nil, the resolvers are called at evaluation time to
+// resolve $variable references and unknown function calls. Pass nil for
+// either resolver to disable that feature.
+func CompileWithResolvers(expr string, namespaces map[string]string, varResolver VariableResolver, funcResolver FunctionResolver) (*Expr, error) {
+	if expr == "" {
+		return nil, errors.New("expr expression is nil")
+	}
+	qy, err := build(expr, namespaces, varResolver, funcResolver)
+	if err != nil {
+		return nil, err
+	}
+	if qy == nil {
+		return nil, fmt.Errorf(fmt.Sprintf("cannot compile XPath expression: %s", expr))
 	}
 	return &Expr{s: expr, q: qy}, nil
 }

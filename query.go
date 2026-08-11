@@ -1459,3 +1459,126 @@ func getXPathType(i interface{}) resultType {
 	}
 	panic(fmt.Errorf("xpath unknown value type: %v", v.Kind()))
 }
+
+// variableQuery resolves a $variable reference at evaluation time via a
+// VariableResolver. For Select (path steps), it iterates through all
+// resolved nodes. For Evaluate (scalar context), it returns the raw value.
+type variableQuery struct {
+	Name     string
+	Prefix   string
+	Resolver VariableResolver
+	nodes    []NodeNavigator // cached resolved nodes
+	posit    int             // current iteration position
+}
+
+func (v *variableQuery) Select(t iterator) NodeNavigator {
+	if v.nodes == nil {
+		// First call: resolve and cache all nodes
+		val, err := v.Resolver.ResolveVariable(v.Prefix, v.Name)
+		if err != nil {
+			return nil
+		}
+		switch val := val.(type) {
+		case NodeNavigator:
+			v.nodes = []NodeNavigator{val}
+		case []NodeNavigator:
+			v.nodes = val
+		default:
+			return nil
+		}
+		v.posit = 0
+	}
+	if v.posit >= len(v.nodes) {
+		return nil
+	}
+	node := v.nodes[v.posit]
+	v.posit++
+	return node
+}
+
+func (v *variableQuery) Evaluate(t iterator) interface{} {
+	val, err := v.Resolver.ResolveVariable(v.Prefix, v.Name)
+	if err != nil {
+		return ""
+	}
+	switch val := val.(type) {
+	case NodeNavigator:
+		return val.Value()
+	case []NodeNavigator:
+		if len(val) > 0 {
+			return val[0].Value()
+		}
+		return ""
+	default:
+		return val
+	}
+}
+
+func (v *variableQuery) Clone() query {
+	return &variableQuery{
+		Name: v.Name, Prefix: v.Prefix, Resolver: v.Resolver,
+		nodes: v.nodes, posit: v.posit,
+	}
+}
+
+func (v *variableQuery) ValueType() resultType { return xpathResultType.Any }
+
+func (v *variableQuery) Properties() queryProp { return queryProps.None }
+
+// functionResolverQuery resolves an unknown function call at evaluation time
+// via a FunctionResolver. Arguments are compiled as sub-queries and evaluated
+// before the resolver is called.
+type functionResolverQuery struct {
+	Prefix   string
+	FuncName string
+	Args     []query
+	Resolver FunctionResolver
+}
+
+func (f *functionResolverQuery) Select(t iterator) NodeNavigator {
+	val := f.Evaluate(t)
+	if nav, ok := val.(NodeNavigator); ok {
+		return nav
+	}
+	return nil
+}
+
+func (f *functionResolverQuery) Evaluate(t iterator) interface{} {
+	resolvedArgs := make([]interface{}, len(f.Args))
+	for i, arg := range f.Args {
+		// For nested function resolvers, use Evaluate directly.
+		// For nodeset queries, iterate all matching nodes.
+		// For scalar queries, get the evaluated value.
+		if _, isResolver := arg.(*functionResolverQuery); isResolver {
+			resolvedArgs[i] = arg.Evaluate(t)
+		} else {
+			switch arg.ValueType() {
+			case xpathResultType.NodeSet, xpathResultType.Any:
+				var nodes []NodeNavigator
+				for node := arg.Select(t); node != nil; node = arg.Select(t) {
+					nodes = append(nodes, node)
+				}
+				resolvedArgs[i] = nodes
+			default:
+				resolvedArgs[i] = arg.Evaluate(t)
+			}
+		}
+	}
+	val, err := f.Resolver.ResolveFunction(f.Prefix, f.FuncName, resolvedArgs)
+	if err != nil {
+		return ""
+	}
+	return val
+}
+
+func (f *functionResolverQuery) Clone() query {
+	args := make([]query, len(f.Args))
+	for i, a := range f.Args {
+		args[i] = a.Clone()
+	}
+	return &functionResolverQuery{Prefix: f.Prefix, FuncName: f.FuncName, Args: args, Resolver: f.Resolver}
+}
+
+func (f *functionResolverQuery) ValueType() resultType { return xpathResultType.Any }
+
+func (f *functionResolverQuery) Properties() queryProp { return queryProps.None }

@@ -39,8 +39,10 @@ var builderProps = struct {
 
 // builder provides building an XPath expressions.
 type builder struct {
-	parseDepth int
-	firstInput query
+	parseDepth   int
+	firstInput   query
+	varResolver  VariableResolver
+	funcResolver FunctionResolver
 }
 
 // axisPredicate creates a predicate to predicating for this axis node.
@@ -595,7 +597,25 @@ func (b *builder) processFunction(root *functionNode, props *builderProp) (query
 		}
 		qyOutput = &functionQuery{Func: stringJoinFunc(input, arg1)}
 	default:
-		return nil, fmt.Errorf("not yet support this function %s()", root.FuncName)
+		if b.funcResolver != nil {
+			// Compile args as sub-queries, wrap in functionResolverQuery
+			args := make([]query, len(root.Args))
+			for i, arg := range root.Args {
+				var argErr error
+				args[i], argErr = b.processNode(arg, flagsEnum.None, props)
+				if argErr != nil {
+					return nil, argErr
+				}
+			}
+			qyOutput = &functionResolverQuery{
+				Prefix:   root.Prefix,
+				FuncName: root.FuncName,
+				Args:     args,
+				Resolver: b.funcResolver,
+			}
+		} else {
+			return nil, fmt.Errorf("not yet support this function %s()", root.FuncName)
+		}
 	}
 	return qyOutput, nil
 }
@@ -693,25 +713,27 @@ func (b *builder) processNode(root node, flags flag, props *builderProp) (q quer
 		q = &groupQuery{Input: q}
 		b.firstInput = q
 	case nodeVariable:
-		// Variables have no binding in a compiled expression, so they cannot
-		// resolve to a query. A bare "$x" already surfaces as an undeclared
-		// variable error because the nil result reaches the caller, but a
-		// variable nested in a larger expression (e.g. "$x/@attr") would be
-		// swallowed here and left as a nil sub-query that panics at select
-		// time. Report it as undeclared instead.
 		n := root.(*variableNode)
-		name := n.Name
-		if n.Prefix != "" {
-			name = n.Prefix + ":" + name
+		if b.varResolver != nil {
+			q = &variableQuery{
+				Name:     n.Name,
+				Prefix:   n.Prefix,
+				Resolver: b.varResolver,
+			}
+		} else {
+			name := n.Name
+			if n.Prefix != "" {
+				name = n.Prefix + ":" + name
+			}
+			err = fmt.Errorf("undeclared variable in XPath expression: $%s", name)
 		}
-		err = fmt.Errorf("undeclared variable in XPath expression: $%s", name)
 	}
 	b.parseDepth--
 	return
 }
 
 // build builds a specified XPath expressions expr.
-func build(expr string, namespaces map[string]string) (q query, err error) {
+func build(expr string, namespaces map[string]string, varResolver VariableResolver, funcResolver FunctionResolver) (q query, err error) {
 	defer func() {
 		if e := recover(); e != nil {
 			switch x := e.(type) {
@@ -725,7 +747,7 @@ func build(expr string, namespaces map[string]string) (q query, err error) {
 		}
 	}()
 	root := parse(expr, namespaces)
-	b := &builder{}
+	b := &builder{varResolver: varResolver, funcResolver: funcResolver}
 	props := builderProps.None
 	return b.processNode(root, flagsEnum.None, &props)
 }
