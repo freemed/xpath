@@ -1562,8 +1562,25 @@ func (f *functionResolverQuery) Select(t iterator) NodeNavigator {
 				resolvedArgs[i] = collectNodes(arg, t)
 			} else {
 				switch arg.ValueType() {
-				case xpathResultType.NodeSet, xpathResultType.Any:
+				case xpathResultType.NodeSet:
 					resolvedArgs[i] = collectNodes(arg, t)
+				case xpathResultType.Any:
+					// "Any" covers both node-valued queries (a variable, a
+					// transform function) and scalar-valued ones (any
+					// built-in function call such as sum()/count()/string(),
+					// whose functionQuery reports Any because the engine does
+					// not track built-in result types). Iterating a scalar
+					// query yields nothing, so handing the resolver an empty
+					// node-set for `format-number(sum(...), ...)` made XSLT
+					// extension functions lose the computed value; evaluate
+					// first and only iterate what is genuinely a node-set
+					// (evaluating a node-valued query returns the query
+					// itself).
+					if val := arg.Evaluate(t); !isNodeValued(val) {
+						resolvedArgs[i] = val
+					} else {
+						resolvedArgs[i] = collectNodes(arg, t)
+					}
 				default:
 					resolvedArgs[i] = arg.Evaluate(t)
 				}
@@ -1610,6 +1627,21 @@ func collectNodes(q query, t iterator) []NodeNavigator {
 		nodes = append(nodes, snapshotNavigator(node))
 	}
 	return nodes
+}
+
+// isNodeValued reports whether an evaluated argument is a node-valued query
+// rather than a scalar.
+//
+// The engine's node-valued queries answer Evaluate by returning themselves
+// (see variableQuery.Evaluate and transformFunctionQuery.Evaluate) so that
+// functions like count() can iterate them with Select; scalar-valued built-ins
+// (sum(), count(), string(), ...) return a number, string or bool.
+func isNodeValued(val interface{}) bool {
+	if val == nil {
+		return false
+	}
+	_, isQuery := val.(query)
+	return isQuery
 }
 
 // snapshotNavigator returns a navigator frozen on the node n currently points
