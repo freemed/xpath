@@ -1595,12 +1595,53 @@ func (f *functionResolverQuery) Select(t iterator) NodeNavigator {
 }
 
 // collectNodes evaluates a query and collects all matching NodeNavigators.
+//
+// The navigators handed out by query.Select implementations are REUSED: the
+// Select closures in childQuery/descendantQuery/attributeQuery/... return the
+// same navigator instance on every call and mutate it in place, so a plain
+// append would collect N aliases of one navigator which the traversal then
+// rewinds back to the top of the input subtree. Every element of the returned
+// slice would report that final position (this is what handed XSLT extension
+// functions the document root twice for `//practice`). Snapshot each result so
+// callers receive the node the traversal actually matched.
 func collectNodes(q query, t iterator) []NodeNavigator {
 	var nodes []NodeNavigator
 	for node := q.Select(t); node != nil; node = q.Select(t) {
-		nodes = append(nodes, node)
+		nodes = append(nodes, snapshotNavigator(node))
 	}
 	return nodes
+}
+
+// snapshotNavigator returns a navigator frozen on the node n currently points
+// at, so that later movement of n does not move the snapshot.
+//
+// Copy() is enough for elements. Attributes need re-locating: gokogiri's
+// navigator Copy() intentionally clears the attribute position (attrIdx = -1),
+// leaving the navigator on the owning element, so the attribute is found again
+// by walking the owner's attributes (attribute names are unique per element).
+func snapshotNavigator(n NodeNavigator) NodeNavigator {
+	if n == nil {
+		return nil
+	}
+	cp := n.Copy()
+	if cp == nil {
+		// No usable copy (should not happen): keep the live navigator rather
+		// than dropping the node from the result.
+		return n
+	}
+	if n.NodeType() != AttributeNode {
+		return cp
+	}
+	name, prefix := n.LocalName(), n.Prefix()
+	if cp.NodeType() == AttributeNode && cp.LocalName() == name && cp.Prefix() == prefix {
+		return cp
+	}
+	for cp.MoveToNextAttribute() {
+		if cp.LocalName() == name && cp.Prefix() == prefix {
+			break
+		}
+	}
+	return cp
 }
 
 func (f *functionResolverQuery) Evaluate(t iterator) interface{} {

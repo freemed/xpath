@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"fmt"
 
-	"github.com/antchfx/xpath"
+	"github.com/freemed/xpath"
 )
 
 type NodeType uint
